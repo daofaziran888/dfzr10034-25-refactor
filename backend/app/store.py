@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 import time as _time
 from collections import defaultdict
 from typing import Any
@@ -18,6 +19,8 @@ class Store:
     """增强版存储层，支持跨模块读写、变更日志和快照。"""
 
     def __init__(self) -> None:
+        # 采集侧并发读写的临界区；账本本身只追加，游标按消费方分别推进。
+        self._ledger_lock = threading.RLock()
         self._seed()
 
     def _seed(self) -> None:
@@ -27,6 +30,11 @@ class Store:
         self._change_log: list[dict[str, Any]] = []
         self._snapshots: dict[str, list[dict[str, Any]]] = {}
         self._pipeline_state: dict[str, dict[str, Any]] = {}
+        # 血缘变动事件账本：只追加、按血缘定序；消费者位点按消费方分别保存。
+        self._lineage_events: list[dict[str, Any]] = []
+        self._lineage_cursors: dict[str, int] = {}
+        # 已写入血缘关系但尚未确认（未拿到确认回执）的变动暂存区。
+        self._lineage_stages: dict[str, dict[str, Any]] = {}
 
     def reset(self) -> None:
         """清空所有数据并重新种子化（测试用）。"""
@@ -86,13 +94,18 @@ class Store:
 
     def log_change(
         self, module: str, entry_id: int, change_type: str,
-        before: Any = None, after: Any = None, source: str = "", scope: str = ""
+        before: Any = None, after: Any = None, source: str = "", scope: str = "",
+        target: str | None = None, **extra: Any
     ) -> dict[str, Any]:
-        """记录一次变更到 change_capture 表。"""
+        """记录一次变更到 change_capture 表。
+
+        target 用于把变更挂到业务资产编号上；extra 可补记 event_id / job_code /
+        seq 等追踪字段，血缘变动事件靠它们与事件账本对齐。
+        """
         log_entry = {
             "id": self.next_id("change_capture"),
             "记录编号": f"CHAN-{self.next_id('change_capture'):04d}",
-            "目标资产": f"{module}#{entry_id}",
+            "目标资产": target or f"{module}#{entry_id}",
             "变更类型": change_type,
             "变更前值": str(before) if before is not None else "",
             "变更后值": str(after) if after is not None else "",
@@ -103,6 +116,8 @@ class Store:
             "pending": True,
             "abnormal": False,
         }
+        for key, value in extra.items():
+            log_entry.setdefault(key, value)
         self.rows("change_capture").append(log_entry)
         self._change_log.append(log_entry)
         return log_entry
@@ -253,6 +268,92 @@ class Store:
                     results.append(row)
                     break
         return results
+
+    # ── 血缘变动事件账本 ──────────────────────────────────────
+
+    def append_lineage_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """追加一条已确认的血缘变动事件，返回带全局序号和幂等键的副本。
+
+        账本只追加不覆盖：同一张表连续多次变动各留一条，下游复算据此区分两次加工。
+        """
+        with self._ledger_lock:
+            seq = len(self._lineage_events) + 1
+            stored = dict(event)
+            stored["seq"] = seq
+            stored.setdefault("event_id", f"LEV-{seq:06d}")
+            stored.setdefault("recorded_at", _time.strftime("%Y-%m-%d %H:%M:%S"))
+            self._lineage_events.append(stored)
+            return dict(stored)
+
+    def lineage_events(
+        self,
+        *,
+        lineage_id: int | None = None,
+        asset_code: str | None = None,
+        after_seq: int = 0,
+    ) -> list[dict[str, Any]]:
+        """读取账本中已确认的事件，保持确认次序（seq 升序）。"""
+        with self._ledger_lock:
+            events = list(self._lineage_events)
+        if lineage_id is not None:
+            events = [e for e in events if e.get("lineage_id") == lineage_id]
+        if asset_code is not None:
+            events = [
+                e for e in events
+                if asset_code in (e.get("target_asset"), e.get("upstream_asset"),
+                                  e.get("downstream_asset"))
+            ]
+        return [e for e in events if int(e.get("seq", 0)) > after_seq]
+
+    def find_lineage_event(self, event_id: str) -> dict[str, Any] | None:
+        with self._ledger_lock:
+            for event in self._lineage_events:
+                if event.get("event_id") == event_id:
+                    return dict(event)
+        return None
+
+    def find_lineage_event_by_key(self, idempotency_key: str) -> dict[str, Any] | None:
+        """按幂等键查找已采集的变动；重复提交据此只生效一次。"""
+        if not idempotency_key:
+            return None
+        with self._ledger_lock:
+            for event in self._lineage_events:
+                if event.get("idempotency_key") == idempotency_key:
+                    return dict(event)
+        return None
+
+    def update_lineage_event(self, event_id: str, **updates: Any) -> dict[str, Any] | None:
+        """更新账本事件（例如补记确认回执），返回更新后的副本。"""
+        with self._ledger_lock:
+            for event in self._lineage_events:
+                if event.get("event_id") == event_id:
+                    event.update(updates)
+                    return dict(event)
+        return None
+
+    def lineage_cursor(self, consumer: str) -> int:
+        """返回消费方已经交付到的账本位点。"""
+        with self._ledger_lock:
+            return int(self._lineage_cursors.get(consumer, 0))
+
+    def advance_lineage_cursor(self, consumer: str, seq: int) -> int:
+        """把消费方位点推进到指定事件；位点只前进不后退。"""
+        with self._ledger_lock:
+            current = int(self._lineage_cursors.get(consumer, 0))
+            if seq > current:
+                self._lineage_cursors[consumer] = seq
+                return seq
+            return current
+
+    def reset_lineage_cursor(self, consumer: str) -> None:
+        """让消费方回到账本起点，用于从实际确认位置补采。"""
+        with self._ledger_lock:
+            self._lineage_cursors[consumer] = 0
+
+    @property
+    def lineage_ledger_size(self) -> int:
+        with self._ledger_lock:
+            return len(self._lineage_events)
 
     # ── 管线状态 ──────────────────────────────────────────────
 

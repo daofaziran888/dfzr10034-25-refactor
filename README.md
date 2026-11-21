@@ -18,6 +18,7 @@
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
+│   ├── app/services/lineage_events.py  血缘变动事件采集（登记/修订共用）
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
 └── docker-compose.yml
@@ -80,6 +81,15 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+- 血缘变动的写入与交付只走 `app/services/lineage_events.py`：
+  - 关系登记（`lineage_track.derive_lineage`）与变更捕获（`change_capture.capture_change`
+    / `capture_lineage_change`）共用同一套事件账本，各自不再单独记一遍；
+  - 关系行只保存当前已提交值，每次写入的前后值按 `seq` 只追加保留，
+    同一张表多次变动不会被合并成末次关系；
+  - 幂等键由「动作 + 血缘 + 作业 + 请求值」生成：同作业重试只生效一次，
+    不同作业对同一字段的有效修改各留一条；
+  - 事件先落账、确认后才进入交付队列；`backfill(consumer)` 按消费方自己的
+    确认位点补采，复算清单 `recompute_manifest()` 一笔变动一条。
 
 领域：数据工程
 子方向：数仓与数据湖
